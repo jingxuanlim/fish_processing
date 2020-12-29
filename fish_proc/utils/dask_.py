@@ -15,6 +15,10 @@ weiz@janelia.hhmi.org
 import numpy as np
 import warnings
 
+def print_client_links(cluster):
+    print(f'Scheduler: {cluster.scheduler_address}')
+    print(f'Dashboard link: {cluster.dashboard_link}')
+    return None
 
 def get_local_cluster(dask_tmp=None, memory_limit='auto'):
     from dask.distributed import LocalCluster
@@ -80,14 +84,19 @@ def setup_local_worker():
 
 
 def setup_workers(numCore=120, is_local=False, dask_tmp=None, memory_limit='auto'):
+    
     from dask.distributed import Client
+    
     if is_local:
         cluster = get_local_cluster(dask_tmp=dask_tmp, memory_limit=memory_limit)
+        print_client_links(cluster)
         client = Client(cluster)
     else:
         cluster = get_jobqueue_cluster()
+        print_client_links(cluster)
         client = Client(cluster)
         cluster.start_workers(numCore)
+        
     return cluster, client
 
 

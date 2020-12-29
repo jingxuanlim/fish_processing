@@ -19,12 +19,15 @@ def print_client_links(cluster):
 
 
 def preprocessing(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (4, 4), num_t_chunks = 80,\
-                  dask_tmp=None, memory_limit=0, is_bz2=False, is_singlePlane=False, down_sample_registration=1):
+                  dask_tmp=None, memory_limit=0, is_bz2=False, is_singlePlane=False, down_sample_registration=1,
+                  is_local=True, numCore=120):
+    
     from ..utils.getCameraInfo import getCameraInfo
     from tqdm import tqdm
     from ..utils.fileio import du
+    
     # set worker
-    cluster, client = fdask.setup_workers(is_local=True, dask_tmp=dask_tmp, memory_limit=memory_limit)
+    cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
     print_client_links(cluster)
     
     if isinstance(save_root, list):
@@ -74,7 +77,10 @@ def preprocessing(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (
         print('========================')
         print('Denoising camera noise')
         if not is_singlePlane:
-            denoised_data = data.map_blocks(lambda v: pixelDenoiseImag(v, cameraNoiseMat=cameraNoiseMat, cameraInfo=cameraInfo))
+            print(data)
+            denoised_data = data.map_blocks(lambda v: pixelDenoiseImag(v, cameraNoiseMat=cameraNoiseMat, cameraInfo=cameraInfo),
+                                            # dtype=np.float32 , meta=np.array((), dtype=np.float32)
+            )
         else:
             denoised_data = data.map_blocks(lambda v: pixelDenoiseImag(v, cameraNoiseMat=cameraNoiseMat, cameraInfo=cameraInfo), new_axis=1)
         print('Denoising camera noise -- save data')
@@ -162,13 +168,39 @@ def preprocessing(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (
     return None
 
 
-def combine_preprocessing(dir_root, save_root, num_t_chunks = 80, dask_tmp=None, memory_limit=0):
-    cluster, client = fdask.setup_workers(is_local=True, dask_tmp=dask_tmp, memory_limit=memory_limit)
+def combine_preprocessing(dir_root, save_root, num_t_chunks = 80, dask_tmp=None, memory_limit=0,
+                          is_local=True, numCore=200):
+
+    # problems with rechunking when chunks situate across multiple 
+    # workers and have to be serialized and passed along to the same
+    # worker for saving
+    
+    dask.config.set(fuse_ave_width=100)
+    
+    cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
     print_client_links(cluster)
+    
     chunks = da.from_zarr(save_root+'/motion_corrected_data_chunks_%03d.zarr'%(0)).chunksize
     trans_data_t = da.concatenate([da.from_zarr(save_root+'/motion_corrected_data_chunks_%03d.zarr'%(nz)) for nz in range(num_t_chunks)], axis=-1)
     trans_data_t = trans_data_t.rechunk((1, chunks[1], chunks[2], -1))
+
     trans_data_t.to_zarr(f'{save_root}/motion_corrected_data.zarr')
+
+    fdask.terminate_workers(cluster, client)
+    
+    return None
+
+def cleanup_preprocessing(save_root, num_t_chunks=40,  dask_tmp=None, memory_limit=0,
+                          is_local=True, numCore=200):
+
+    # deleting the multiple zarr folders can be done in parallel
+    # but only to the extend of num_t_chunks (since I suspect you
+    # can't have multiple workers each deleting a subset of a zarr folder)
+
+    numCore = np.min([num_t_chunks, numCore])
+    
+    cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
+    print_client_links(cluster)
     
     def rm_tmp(nz, save_root=save_root):
         if os.path.exists(f'{save_root}/motion_corrected_data_chunks_%03d.zarr'%(nz)):
@@ -180,9 +212,10 @@ def combine_preprocessing(dir_root, save_root, num_t_chunks = 80, dask_tmp=None,
     #         if os.path.exists(f'{save_root}/motion_corrected_data_chunks_%03d.zarr'%(nz)):
     #             print('Remove temporal files of registration at %03d'%(nz))
     #             shutil.rmtree(f'{save_root}/motion_corrected_data_chunks_%03d.zarr'%(nz))
-    nz_list = da.from_array(np.arange(num_t_chunks), chunks=(1)) 
-    da.map_blocks(rm_tmp, nz_list).compute()
+    nz_list = da.arange(num_t_chunks, chunks=1)
+    da.map_blocks(rm_tmp, nz_list, dtype=np.int64, meta=np.array((), dtype=np.int64)).compute()
     fdask.terminate_workers(cluster, client)
+
     return None
 
 
@@ -278,9 +311,10 @@ def preprocessing_cluster(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, ns
     return None
 
 
-def detrend_data(dir_root, save_root, window=100, percentile=20, nsplit = (4, 4), dask_tmp=None, memory_limit=0):
+def detrend_data(dir_root, save_root, window=100, percentile=20, nsplit = (4, 4), dask_tmp=None, memory_limit=0,
+                 is_local=True, numCore=120):
     if not os.path.exists(f'{save_root}/detrend_data.zarr'):
-        cluster, client = fdask.setup_workers(is_local=True, dask_tmp=dask_tmp, memory_limit=memory_limit)
+        cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
         print_client_links(cluster)
         print('Compute detrend data ---')
         trans_data_t = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
@@ -291,8 +325,9 @@ def detrend_data(dir_root, save_root, window=100, percentile=20, nsplit = (4, 4)
     return None
 
 
-def default_mask(dir_root, save_root, dask_tmp=None, memory_limit=0):
-    cluster, client = fdask.setup_workers(is_local=True, dask_tmp=dask_tmp, memory_limit=memory_limit)
+def default_mask(dir_root, save_root, dask_tmp=None, memory_limit=0,
+                 is_local=True, numCore=120):
+    cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
     print_client_links(cluster)
     print('Compute default mask ---')
     Y = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
@@ -322,12 +357,13 @@ def local_pca_on_mask(save_root, is_dff=False, dask_tmp=None, memory_limit=0):
     return None
 
 
-def demix_cells(save_root, dt, is_skip=True, dask_tmp=None, memory_limit=0):
+def demix_cells(save_root, dt, is_skip=True, dask_tmp=None, memory_limit=0,
+                is_local=True, numCore=120):
     '''
       1. local pca denoise
       2. cell segmentation
     '''
-    cluster, client = fdask.setup_workers(is_local=True, dask_tmp=dask_tmp, memory_limit=memory_limit)
+    cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
     print_client_links(cluster)
     Y_svd = da.from_zarr(f'{save_root}/detrend_data.zarr')
     Y_svd = Y_svd[:, :, :, ::dt]
@@ -345,12 +381,12 @@ def check_fail_block(save_root, dt=0):
     print(file)
 
 
-def check_demix_cells(save_root, block_id, plot_global=True, plot_mask=True, mask=None):
+def check_demix_cells(savetmp, save_root, block_id, plot_global=True, plot_mask=True, mask=None):
     import matplotlib.pyplot as plt
-    Y_d_ave = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
+    Y_d_ave = da.from_zarr(f'{savetmp}/motion_corrected_data.zarr')
     _, xdim, ydim, _ = Y_d_ave.shape
     _, x_, y_, _ = Y_d_ave.chunksize
-    Y_d_ave_ = np.load(save_root+'Y_ave.npy')
+    Y_d_ave_ = np.load(save_root+'/Y_ave.npy')
     Y_d_ave_ = Y_d_ave_[block_id[0],block_id[1]*x_:block_id[1]*x_+x_, block_id[2]*y_:block_id[2]*y_+y_].squeeze()
     try:
         A_ = load_A_matrix(save_root=save_root, block_id=block_id, min_size=0)
@@ -382,7 +418,7 @@ def check_demix_cells(save_root, block_id, plot_global=True, plot_mask=True, mas
     except:
         print('No components')
     if plot_global:
-        Y_d_ave = np.load(save_root+'Y_ave.npy')
+        Y_d_ave = np.load(save_root+'/Y_ave.npy')
         area_mask = np.zeros((xdim, ydim)).astype('bool')
         area_mask[block_id[1]*x_:block_id[1]*x_+x_, block_id[2]*y_:block_id[2]*y_+y_]=True
         plt.figure(figsize=(16, 16))
@@ -420,7 +456,8 @@ def check_demix_cells_layer(save_root, nlayer, nsplit = (10, 16), mask=None):
     return None
 
 
-def compute_cell_dff_raw(save_root, mask, dask_tmp=None, memory_limit=0):
+def compute_cell_dff_raw(save_root, mask, dask_tmp=None, memory_limit=0,
+                         is_local=True, numCore=120):
     '''
       1. local pca denoise (\delta F signal)
       2. baseline
@@ -430,7 +467,7 @@ def compute_cell_dff_raw(save_root, mask, dask_tmp=None, memory_limit=0):
     # set worker
     if not os.path.exists(f'{save_root}/cell_raw_dff'):
         os.mkdir(f'{save_root}/cell_raw_dff')
-    cluster, client = fdask.setup_workers(is_local=True, dask_tmp=dask_tmp, memory_limit=memory_limit)
+    cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
     print_client_links(cluster)
     trans_data_t = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
     if not os.path.exists(f'{save_root}/cell_raw_dff'):
@@ -453,10 +490,11 @@ def combine_dff(save_root):
     A_list = []
     dFF_list = []
     A_shape = []
-    for _ in tqdm(glob(save_root+'cell_raw_dff/period_Y_demix_block_*.h5')):
+    for _ in tqdm(glob(save_root+'/cell_raw_dff/period_Y_demix_block_*.h5')):
         try:
             _ = File(_)
         except:
+            print('continuing...')
             continue
         A_loc = _['A_loc'].value
         A = _['A'].value
@@ -470,7 +508,7 @@ def combine_dff(save_root):
                 A_tmp[:x_, :y_] = A[:, :, n_]
                 A_list.append(A_tmp)
                 dFF_list.append(dFF[n_])
-    np.savez(save_root+'cell_raw_dff', \
+    np.savez(save_root+'/cell_raw_dff', \
              A_loc=np.array(A_loc_list).astype('int16'), \
              A_shape=np.array(A_shape).astype('int16'), \
              A=np.array(A_list).astype('float16'), \
@@ -491,7 +529,7 @@ def combine_dff_sparse(save_root):
     dFF_list = []
     A_shape = []
     from tqdm import tqdm
-    for _ in tqdm(glob(save_root+'cell_raw_dff/period_Y_demix_block_*.h5')):
+    for _ in tqdm(glob(save_root+'/cell_raw_dff/period_Y_demix_block_*.h5')):
         try:
             _ = File(_)
         except:
@@ -511,7 +549,7 @@ def combine_dff_sparse(save_root):
                     dFF_list.append(dFF[n_])
         except:
             pass
-    np.savez(save_root+'cell_raw_dff_sparse', \
+    np.savez(save_root+'/cell_raw_dff_sparse', \
              A_loc=np.array(A_loc_list).astype('int16'), \
              A_shape=np.array(A_shape).astype('int16'), \
              A=np.array(A_list).astype('float16'), \
