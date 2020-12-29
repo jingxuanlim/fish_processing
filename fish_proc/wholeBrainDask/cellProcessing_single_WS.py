@@ -12,12 +12,6 @@ from ..utils import dask_ as fdask
 cameraNoiseMat = '/nrs/ahrens/ahrenslab/Ziqiang/gainMat/gainMat20180208'
 
 
-def print_client_links(cluster):
-    print(f'Scheduler: {cluster.scheduler_address}')
-    print(f'Dashboard link: {cluster.dashboard_link}')
-    return None
-
-
 def preprocessing(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (4, 4), num_t_chunks = 80,\
                   dask_tmp=None, memory_limit=0, is_bz2=False, is_singlePlane=False, down_sample_registration=1,
                   is_local=True, numCore=120):
@@ -28,7 +22,6 @@ def preprocessing(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (
     
     # set worker
     cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
-    print_client_links(cluster)
     
     if isinstance(save_root, list):
         save_root_ext = save_root[1]
@@ -178,7 +171,6 @@ def combine_preprocessing(dir_root, save_root, num_t_chunks = 80, dask_tmp=None,
     dask.config.set(fuse_ave_width=100)
     
     cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
-    print_client_links(cluster)
     
     chunks = da.from_zarr(save_root+'/motion_corrected_data_chunks_%03d.zarr'%(0)).chunksize
     trans_data_t = da.concatenate([da.from_zarr(save_root+'/motion_corrected_data_chunks_%03d.zarr'%(nz)) for nz in range(num_t_chunks)], axis=-1)
@@ -200,7 +192,6 @@ def cleanup_preprocessing(save_root, num_t_chunks=40,  dask_tmp=None, memory_lim
     numCore = np.min([num_t_chunks, numCore])
     
     cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
-    print_client_links(cluster)
     
     def rm_tmp(nz, save_root=save_root):
         if os.path.exists(f'{save_root}/motion_corrected_data_chunks_%03d.zarr'%(nz)):
@@ -224,7 +215,6 @@ def preprocessing_cluster(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, ns
     from ..utils.getCameraInfo import getCameraInfo
     # set worker
     cluster, client = fdask.setup_workers(numCore=200, is_local=False, dask_tmp=dask_tmp, memory_limit=memory_limit)
-    print_client_links(cluster)
 
     if not os.path.exists(f'{save_root}/denoised_data.zarr'):
         if not is_bz2:
@@ -315,7 +305,6 @@ def detrend_data(dir_root, save_root, window=100, percentile=20, nsplit = (4, 4)
                  is_local=True, numCore=120):
     if not os.path.exists(f'{save_root}/detrend_data.zarr'):
         cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
-        print_client_links(cluster)
         print('Compute detrend data ---')
         trans_data_t = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
         Y_d = trans_data_t.map_blocks(lambda v: v - baseline(v, window=window, percentile=percentile), dtype='float16')
@@ -328,7 +317,6 @@ def detrend_data(dir_root, save_root, window=100, percentile=20, nsplit = (4, 4)
 def default_mask(dir_root, save_root, dask_tmp=None, memory_limit=0,
                  is_local=True, numCore=120):
     cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
-    print_client_links(cluster)
     print('Compute default mask ---')
     Y = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
     Y_d = da.from_zarr(f'{save_root}/detrend_data.zarr')
@@ -344,7 +332,6 @@ def default_mask(dir_root, save_root, dask_tmp=None, memory_limit=0,
 
 def local_pca_on_mask(save_root, is_dff=False, dask_tmp=None, memory_limit=0):
     cluster, client = fdask.setup_workers(is_local=True, dask_tmp=dask_tmp, memory_limit=memory_limit)
-    print_client_links(cluster)
     Y_d = da.from_zarr(f'{save_root}/detrend_data.zarr')
     if is_dff:
         Y_t = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
@@ -364,7 +351,6 @@ def demix_cells(save_root, dt, is_skip=True, dask_tmp=None, memory_limit=0,
       2. cell segmentation
     '''
     cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
-    print_client_links(cluster)
     Y_svd = da.from_zarr(f'{save_root}/detrend_data.zarr')
     Y_svd = Y_svd[:, :, :, ::dt]
     mask = da.from_zarr(f'{save_root}/Y_d_max.zarr')
@@ -468,7 +454,6 @@ def compute_cell_dff_raw(save_root, mask, dask_tmp=None, memory_limit=0,
     if not os.path.exists(f'{save_root}/cell_raw_dff'):
         os.mkdir(f'{save_root}/cell_raw_dff')
     cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
-    print_client_links(cluster)
     trans_data_t = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
     if not os.path.exists(f'{save_root}/cell_raw_dff'):
         os.makedirs(f'{save_root}/cell_raw_dff')
@@ -559,7 +544,6 @@ def combine_dff_sparse(save_root):
 
 def compute_dff_from_f(save_root, min_F=20, window=400, percentile=20, downsample=10, dFF_max=5, dask_tmp=None, memory_limit=0):
     cluster, client = fdask.setup_workers(is_local=True, dask_tmp=dask_tmp, memory_limit=memory_limit)
-    print_client_links(cluster)
     
     _ = np.load(save_root+'cell_raw_dff_sparse.npz', allow_pickle=True)
     A = _['A'].astype('float')
