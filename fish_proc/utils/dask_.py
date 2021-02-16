@@ -26,10 +26,10 @@ def get_local_cluster(dask_tmp=None, memory_limit='auto'):
     n_workers = cpu_count()
     if dask_tmp is None:
         # return LocalCluster(n_workers=n_workers, processes=False, threads_per_worker=1, memory_limit=memory_limit)
-        return LocalCluster(processes=False, memory_limit=memory_limit)
+        return LocalCluster(processes=False, memory_limit=memory_limit, n_workers=n_workers)
     else:
         # return LocalCluster(n_workers=n_workers, processes=False, threads_per_worker=1, local_dir=dask_tmp, memory_limit=memory_limit)
-        return LocalCluster(processes=False, local_dir=dask_tmp, memory_limit=memory_limit)
+        return LocalCluster(processes=False, local_dir=dask_tmp, memory_limit=memory_limit, n_workers=n_workers)
 
 
 def get_jobqueue_cluster(walltime='12:00', ncpus=1, cores=1, local_directory=None, memory='16GB', env_extra=None, **kwargs):
@@ -88,7 +88,8 @@ def setup_workers(numCore=120, is_local=False, dask_tmp=None, memory_limit='auto
     from dask.distributed import Client
     
     if is_local:
-        cluster = get_local_cluster(dask_tmp=dask_tmp, memory_limit=memory_limit)
+        cluster = get_local_cluster(dask_tmp=dask_tmp,
+                                    memory_limit=memory_limit)
         print_client_links(cluster)
         client = Client(cluster)
     else:
@@ -98,6 +99,21 @@ def setup_workers(numCore=120, is_local=False, dask_tmp=None, memory_limit='auto
         cluster.start_workers(numCore)
         
     return cluster, client
+
+
+def start_cluster(is_local=False, dask_tmp=None, memory_limit='auto'):
+    
+    from dask.distributed import Client
+    
+    if is_local:
+        cluster = get_local_cluster(dask_tmp=dask_tmp,
+                                    memory_limit=memory_limit)
+        print_client_links(cluster)
+    else:
+        cluster = get_jobqueue_cluster()
+        print_client_links(cluster)
+        
+    return cluster
 
 
 def terminate_workers(cluster, client):

@@ -308,6 +308,9 @@ def pos_sig_correction(mov, dt, axis_=-1):
 
 
 def compute_cell_raw_dff(block_F, mask, save_root='.', ext='', block_id=None):
+
+    block_F = block_F.copy()
+    
     from h5py import File
     _, x_, y_, _ = block_F.shape
     A_= load_A_matrix(save_root=save_root, ext=ext, block_id=block_id, min_size=0)

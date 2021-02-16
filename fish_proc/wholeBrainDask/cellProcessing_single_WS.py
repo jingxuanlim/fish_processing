@@ -5,6 +5,7 @@ from h5py import File
 import warnings
 warnings.filterwarnings('ignore')
 import dask
+from dask.distributed import Client
 dask.config.set({"jobqueue.lsf.use-stdin": True})
 import dask.array as da
 from .utils import *
@@ -14,7 +15,7 @@ cameraNoiseMat = '/nrs/ahrens/ahrenslab/Ziqiang/gainMat/gainMat20180208'
 
 def preprocessing(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (4, 4), num_t_chunks = 80,\
                   dask_tmp=None, memory_limit=0, is_bz2=False, is_singlePlane=False, down_sample_registration=1,
-                  is_local=True, numCore=120):
+                  is_local=True, numCore=120, store_denoised_data=False):
     
     from ..utils.getCameraInfo import getCameraInfo
     from tqdm import tqdm
@@ -77,11 +78,11 @@ def preprocessing(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (
         else:
             denoised_data = data.map_blocks(lambda v: pixelDenoiseImag(v, cameraNoiseMat=cameraNoiseMat, cameraInfo=cameraInfo), new_axis=1)
         print('Denoising camera noise -- save data')
-        denoised_data.to_zarr(f'{save_root}/denoised_data.zarr')
+        if store_denoised_data: denoised_data.to_zarr(f'{save_root}/denoised_data.zarr')
         num_t = denoised_data.shape[0]
         
     print('Denoising camera noise -- load saved data')
-    denoised_data = da.from_zarr(f'{save_root}/denoised_data.zarr')
+    if store_denoised_data: denoised_data = da.from_zarr(f'{save_root}/denoised_data.zarr')
     chunks = denoised_data.shape[1:]
     num_t = denoised_data.shape[0]
 
@@ -122,8 +123,9 @@ def preprocessing(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (
         splits_ = np.array_split(np.arange(num_t).astype('int'), num_t_chunks)
         print(f'Processing total {num_t_chunks} chunks in time.......')
         # estimate size of data to store
-        used_ = du(f'{save_root}/denoised_data.zarr/')
-        est_data_size = int(used_.decode('utf-8'))//(2**20*num_t_chunks*2)+5 #kb to Gb
+        if store_denoised_data: used_ = int(du(f'{save_root}/denoised_data.zarr/').decode('utf-8'))
+        else: used_ = (denoised_data.size * denoised_data.itemsize) / 1000  ## convert to KB
+        est_data_size = used_//(2**20*num_t_chunks*2)+5 #kb to Gb
         for nz, n_split in enumerate(splits_):
             if not os.path.exists(save_root+'/motion_corrected_data_chunks_%03d.zarr'%(nz)):
                 if 'save_root_ext' in locals():
@@ -160,8 +162,194 @@ def preprocessing(dir_root, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (
     fdask.terminate_workers(cluster, client)
     return None
 
+def Preprocess(dir_roots, save_root, cameraNoiseMat=cameraNoiseMat, nsplit = (4, 4), num_t_chunks = 80,\
+               dask_tmp=None, memory_limit=0, is_bz2=False, is_singlePlane=False, down_sample_registration=1,
+               is_local=True, numCore=120, store_denoised_data=False):
+    """Adapated from preprocessing
+    TODO
+    - [ ] work on multiple directories
+    - [ ] break it down to smaller parts
+    - [-] disable extended drive -- cancelled because I just just leave it alone
+    - [ ] use dask sparingly
+    
+    dir_root [list]: list of directories containing raw .h5 files. can
+                     be of length 1 (i.e. len(dir_root) = 1)
+    """
+    
+    from ..utils.getCameraInfo import getCameraInfo
+    from tqdm import tqdm
+    from ..utils.fileio import du
+    
+    # set worker
+    # cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
+    
+    if isinstance(save_root, list):
+        save_root_ext = save_root[1]
+        save_root = save_root[0]
+    
+    print(f'Tmp files will be saved to {save_root}')
+    if 'save_root_ext' in locals():
+        print(f'With extended drive to {save_root_ext}')
 
-def combine_preprocessing(dir_root, save_root, num_t_chunks = 80, dask_tmp=None, memory_limit=0,
+    if not os.path.exists(f'{save_root}/denoised_data.zarr'):
+        print('========================')
+        print('Getting data infos')
+        if not is_bz2:
+            import itertools  ## added
+            dir_files = [sorted(glob(dir_root+'/*.h5')) for dir_root in dir_roots]  ## added
+            files = list(itertools.chain.from_iterable(dir_files))            
+            chunks = File(files[0],'r')['default'].shape
+            if not is_singlePlane:
+                data = da.stack([da.from_array(File(fn,'r')['default'], chunks=chunks) for fn in files])
+            else:
+                if len(chunks)==2:
+                    data = da.stack([da.from_array(File(fn,'r')['default'], chunks=chunks) for fn in files])
+                else:
+                    data = da.concatenate([da.from_array(File(fn,'r')['default'], chunks=(1, chunks[1], chunks[2])) for fn in files], axis=0)
+            cameraInfo = getCameraInfo(dir_roots[0])  ## assume camera info same for all directories
+        else:  ## if is_bz2 (NOT UPDATED TO WORK WITH dir_roots)
+            import xml.etree.ElementTree as ET
+            from utils import load_bz2file
+            dims = ET.parse(dir_root+'/ch0.xml')
+            root = dims.getroot()
+            for info in root.findall('info'):
+                if info.get('dimensions'):
+                    dims = info.get('dimensions')
+            dims = dims.split('x')
+            dims = [int(float(num)) for num in dims]
+            files = sorted(glob(dir_root+'/*.stack.bz2'))
+            imread = dask.delayed(lambda v: load_bz2file(v, dims), pure=True)
+            lazy_data = [imread(fn) for fn in files]
+            sample = lazy_data[0].compute()
+            data = da.stack([da.from_delayed(fn, shape=sample.shape, dtype=sample.dtype) for fn in lazy_data])
+            cameraInfo = getCameraInfo(dir_root)
+            pixel_x0, pixel_x1, pixel_y0, pixel_y1 = [int(_) for _ in cameraInfo['camera_roi'].split('_')]
+            pixel_x0 = pixel_x0-1
+            pixel_y0 = pixel_y0-1
+            cameraInfo['camera_roi'] = '%d_%d_%d_%d'%(pixel_x0, pixel_x1, pixel_y0, pixel_y1)
+            chunks = sample.shape
+        # pixel denoise
+        print('========================')
+        print('Denoising camera noise')
+        if not is_singlePlane:
+            print(data)
+            denoised_data = data.map_blocks(lambda v: pixelDenoiseImag(v, cameraNoiseMat=cameraNoiseMat, cameraInfo=cameraInfo),
+                                            # dtype=np.float32 , meta=np.array((), dtype=np.float32)
+            )
+        else:
+            denoised_data = data.map_blocks(lambda v: pixelDenoiseImag(v, cameraNoiseMat=cameraNoiseMat, cameraInfo=cameraInfo), new_axis=1)
+        print('Denoising camera noise -- save data')
+        if store_denoised_data:
+            with fdask.start_cluster() as cluster, Client(cluster) as client:
+                cluster.start_workers(int(numCore))            
+                denoised_data.to_zarr(f'{save_root}/denoised_data.zarr')
+                try: cluster.stop_all_jobs()
+                except: pass
+        num_t = denoised_data.shape[0]
+        
+    print('Denoising camera noise -- load saved data')
+    if store_denoised_data: denoised_data = da.from_zarr(f'{save_root}/denoised_data.zarr')
+    chunks = denoised_data.shape[1:]
+    num_t = denoised_data.shape[0]
+
+    # save and compute reference image
+    print('Compute reference image ---')
+    if not os.path.exists(f'{save_root}/motion_fix_.h5'):
+        med_win = len(denoised_data)//2
+        with fdask.start_cluster() as cluster, Client(cluster) as client:
+            cluster.start_workers(int(numCore * 0.1))
+            ref_img = denoised_data[med_win-50:med_win+50].mean(axis=0).compute()
+            try: cluster.stop_all_jobs()
+            except: pass
+        save_h5(f'{save_root}/motion_fix_.h5', ref_img, dtype='float16')
+
+    print('--- Done computing reference image')
+
+    # compute affine transform
+    print('Registration to reference image ---')
+    # create trans_affs file
+    if not os.path.exists(f'{save_root}/trans_affs.npy'):
+        ref_img = File(f'{save_root}/motion_fix_.h5', 'r')['default'].value
+        ref_img = ref_img.max(axis=0, keepdims=True)
+        if down_sample_registration==1:
+            with fdask.start_cluster() as cluster, Client(cluster) as client:
+                cluster.start_workers(int(numCore))
+                trans_affine = denoised_data.map_blocks(lambda x: estimate_rigid2d(x, fixed=ref_img), dtype='float32', drop_axis=(3), chunks=(1,4,4)).compute()
+                try: cluster.stop_all_jobs()
+                except: pass
+        else:
+            #### downsample trans_affine case
+            with fdask.start_cluster() as cluster, Client(cluster) as client:
+                cluster.start_workers(int(numCore))            
+                trans_affine = denoised_data[0::down_sample_registration].map_blocks(lambda x: estimate_rigid2d(x, fixed=ref_img), dtype='float32', drop_axis=(3), chunks=(1,4,4)).compute()
+                try: cluster.stop_all_jobs()
+                except: pass
+            len_dat = denoised_data.shape[0]
+            trans_affine = rigid_interp(trans_affine, down_sample_registration, len_dat)
+        # save trans_affs file
+        np.save(f'{save_root}/trans_affs.npy', trans_affine)
+    # load trans_affs file
+    trans_affine_ = np.load(f'{save_root}/trans_affs.npy')
+    trans_affine_ = da.from_array(trans_affine_, chunks=(1,4,4))
+    print('--- Done registration reference image')
+
+    # apply affine transform
+    if not os.path.exists(f'{save_root}/motion_corrected_data.zarr'):
+        # fix memory issue to load data all together for transpose on local machine
+        # load data
+        # swap axes
+        splits_ = np.array_split(np.arange(num_t).astype('int'), num_t_chunks)
+        print(f'Processing total {num_t_chunks} chunks in time.......')
+        # estimate size of data to store
+        if store_denoised_data: used_ = int(du(f'{save_root}/denoised_data.zarr/').decode('utf-8'))
+        else: used_ = (denoised_data.size * denoised_data.itemsize) / 1000  ## convert to KB
+        est_data_size = used_//(2**20*num_t_chunks*2)+5 #kb to Gb
+
+        ## TODO: can be parallelized
+        with fdask.start_cluster() as cluster, Client(cluster) as client:
+            cluster.start_workers(int(numCore))        
+            for nz, n_split in enumerate(splits_):
+                if not os.path.exists(save_root+'/motion_corrected_data_chunks_%03d.zarr'%(nz)):
+                    if 'save_root_ext' in locals():
+                        if os.path.exists(save_root_ext+'/motion_corrected_data_chunks_%03d.zarr'%(nz)):
+                            continue
+                    print('Apply registration to rechunk layer %03d'%(nz))
+                    trans_data_ = da.map_blocks(apply_transform3d, denoised_data[n_split], trans_affine_[n_split], chunks=(1, *denoised_data.shape[1:]), dtype='float16')
+                    print('Starting to rechunk layer %03d'%(nz))
+                    trans_data_t_z = trans_data_.rechunk((-1, 1, chunks[1]//nsplit[0], chunks[2]//nsplit[1])).transpose((1, 2, 3, 0))
+                    # check space availablity
+                    _, _, free_ = shutil.disk_usage(f'{save_root}/')
+                    if (free_//(2**30)) > est_data_size:
+                        print(f'Remaining space {free_//(2**30)} GB..... -- start to save at {save_root}')
+                        trans_data_t_z.to_zarr(save_root+'/motion_corrected_data_chunks_%03d.zarr'%(nz))
+                    else:
+                        try:
+                            print(f'Remaining space {free_//(2**30)} GB..... -- start to save at {save_root_ext}')
+                            trans_data_t_z.to_zarr(save_root_ext+'/motion_corrected_data_chunks_%03d.zarr'%(nz))
+                        except Exception as e:
+                            # if any error -- break the code
+                            print(e)    
+                            fdask.terminate_workers(cluster, client)
+                            return None
+                    del trans_data_t_z
+                    gc.collect()
+                    print('finishing rechunking time chunk -- %03d of %03d'%(nz, num_t_chunks))
+
+            try: cluster.stop_all_jobs()
+            except: pass
+
+        print('Remove temporal files of registration')
+        if os.path.exists(f'{save_root}/denoised_data.zarr'):
+            shutil.rmtree(f'{save_root}/denoised_data.zarr')
+        for ext_files in tqdm(glob(save_root_ext+'/motion_corrected_data_chunks_*.zarr')):
+            print(f'Moving file {ext_files} to Tmp-file folder.....')
+            shutil.move(ext_files, save_root+'/')
+    fdask.terminate_workers(cluster, client)
+    return None
+
+
+def combine_preprocessing(dir_root, save_root, num_t_chunks = 80,
+                          dask_tmp=None, memory_limit=0,
                           is_local=True, numCore=200):
 
     # problems with rechunking when chunks situate across multiple 
@@ -181,6 +369,55 @@ def combine_preprocessing(dir_root, save_root, num_t_chunks = 80, dask_tmp=None,
     fdask.terminate_workers(cluster, client)
     
     return None
+
+
+def CombineMotionCorrectedData(save_root, num_t_chunks = 80,
+                               dask_tmp=None, memory_limit=0,
+                               is_local=True, numCore=200):
+    """
+    Adapated from combine_preprocessing()
+    """
+
+    # problems with rechunking when chunks situate across multiple 
+    # workers and have to be serialized and passed along to the same
+    # worker for saving
+    
+    dask.config.set(fuse_ave_width=100)
+    
+    chunks = da.from_zarr(save_root+'/motion_corrected_data_chunks_%03d.zarr'%(0)).chunksize
+    trans_data_t = da.concatenate([da.from_zarr(save_root+'/motion_corrected_data_chunks_%03d.zarr'%(nz)) for nz in range(num_t_chunks)], axis=-1)
+    trans_data_t = trans_data_t.rechunk((1, chunks[1], chunks[2], -1))
+
+    with fdask.start_cluster(is_local=is_local,
+                             dask_tmp=dask_tmp,
+                             memory_limit=memory_limit)\
+                             as cluster, Client(cluster) as client:
+        
+        cluster.start_workers(int(numCore))
+        
+        trans_data_t.to_zarr(f'{save_root}/motion_corrected_data.zarr')
+
+        try: cluster.stop_all_jobs()
+        except: pass        
+
+    return None
+
+
+def RemoveMotionCorrectedChunks(save_root, num_t_chunks=40):
+    """
+    Adapted from cleanup_preprocessing()
+    """
+    from analysis_toolbox.utils import find_files, start_cluster
+
+    motion_corrected_data_chunk_paths = find_files(save_root + '/', grep='[0-9][0-9][0-9]', ext='zarr', return_path=True)
+    remove_all = [dask.delayed(shutil.rmtree)(path) for path in motion_corrected_data_chunk_paths]
+    
+    with start_cluster(cores=num_t_chunks, force_local=True) as client, Client(client) as cluster:
+        cluster.compute(remove_all, scheduler="processes")
+
+        try: cluster.stop_all_jobs()
+        except: pass        
+
 
 def cleanup_preprocessing(save_root, num_t_chunks=40,  dask_tmp=None, memory_limit=0,
                           is_local=True, numCore=200):
@@ -314,6 +551,30 @@ def detrend_data(dir_root, save_root, window=100, percentile=20, nsplit = (4, 4)
     return None
 
 
+def Detrend(save_root, window=100, percentile=20,
+            dask_tmp=None, memory_limit=0,
+            is_local=True, numCore=120):
+    """
+    Adapated from detrend_data()
+    """
+    print('Compute detrend data ---')
+    trans_data_t = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
+    Y_d = trans_data_t.map_blocks(lambda v: v - baseline(v, window=window, percentile=percentile), dtype='float16')
+    
+    with fdask.start_cluster(is_local=is_local,
+                             dask_tmp=dask_tmp,
+                             memory_limit=memory_limit)\
+                             as cluster, Client(cluster) as client:
+        
+        cluster.start_workers(int(numCore))            
+        Y_d.to_zarr(f'{save_root}/detrend_data.zarr')
+
+        try: cluster.stop_all_jobs()
+        except: pass                
+
+    return None
+
+
 def default_mask(dir_root, save_root, dask_tmp=None, memory_limit=0,
                  is_local=True, numCore=120):
     cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
@@ -327,6 +588,34 @@ def default_mask(dir_root, save_root, dask_tmp=None, memory_limit=0,
     Y_ave = Y.astype('float').mean(axis=-1, keepdims=True).astype(Y.dtype)
     Y_ave.to_zarr(f'{save_root}/Y_ave.zarr', overwrite=True)
     fdask.terminate_workers(cluster, client)
+    return None
+
+
+def CreateDefaultMask(save_root,
+                      dask_tmp=None, memory_limit=0,
+                      is_local=True, numCore=120):
+    
+    print('Compute default mask ---')
+    Y = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
+    Y_d = da.from_zarr(f'{save_root}/detrend_data.zarr')
+    
+    Y_d_max = Y_d.max(axis=-1, keepdims=True)
+    Y_max = Y.max(axis=-1, keepdims=True)
+    Y_ave = Y.astype('float').mean(axis=-1, keepdims=True).astype(Y.dtype)
+
+    with fdask.start_cluster(is_local=is_local,
+                             dask_tmp=dask_tmp,
+                             memory_limit=memory_limit)\
+                             as cluster, Client(cluster) as client:
+
+        cluster.start_workers(int(numCore))            
+        Y_d_max.to_zarr(f'{save_root}/Y_d_max.zarr', overwrite=True)
+        Y_max.to_zarr(f'{save_root}/Y_max.zarr', overwrite=True)
+        Y_ave.to_zarr(f'{save_root}/Y_ave.zarr', overwrite=True)        
+
+        try: cluster.stop_all_jobs()
+        except: pass
+        
     return None
 
 
@@ -359,6 +648,40 @@ def demix_cells(save_root, dt, is_skip=True, dask_tmp=None, memory_limit=0,
     da.map_blocks(demix_blocks, Y_svd.astype('float'), mask.astype('float'), chunks=(1, 1, 1, 1), dtype='int8', save_folder=save_root, is_skip=is_skip).compute()
     fdask.terminate_workers(cluster, client)
     time.sleep(10)
+    return None
+
+
+def Demix(save_root, dt, is_skip=True, dask_tmp=None, memory_limit=0,
+                is_local=True, numCore=120):
+    """
+    Adapted from demix_cells()
+    1. local pca denoise
+    2. cell segmentation
+    """
+    
+    Y_svd = da.from_zarr(f'{save_root}/detrend_data.zarr')
+    Y_svd = Y_svd[:, :, :, ::dt]
+    mask = da.from_zarr(f'{save_root}/Y_d_max.zarr')
+    if not os.path.exists(f'{save_root}/sup_demix_rlt/'):
+        os.mkdir(f'{save_root}/sup_demix_rlt/')
+
+    with fdask.start_cluster(is_local=is_local,
+                             dask_tmp=dask_tmp,
+                             memory_limit=memory_limit)\
+                             as cluster, Client(cluster) as client:
+        
+        cluster.start_workers(int(numCore))                    
+        da.map_blocks(demix_blocks,
+                      Y_svd.astype('float'),
+                      mask.astype('float'),
+                      chunks=(1, 1, 1, 1),
+                      dtype='int8',
+                      save_folder=save_root,
+                      is_skip=is_skip).compute()
+        
+        try: cluster.stop_all_jobs()
+        except: pass
+        
     return None
 
 
@@ -453,12 +776,16 @@ def compute_cell_dff_raw(save_root, mask, dask_tmp=None, memory_limit=0,
     # set worker
     if not os.path.exists(f'{save_root}/cell_raw_dff'):
         os.mkdir(f'{save_root}/cell_raw_dff')
-    cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
+        
+    if numCore is not None: cluster, client = fdask.setup_workers(numCore=numCore, is_local=is_local, dask_tmp=dask_tmp, memory_limit=memory_limit)
+    
     trans_data_t = da.from_zarr(f'{save_root}/motion_corrected_data.zarr')
     if not os.path.exists(f'{save_root}/cell_raw_dff'):
         os.makedirs(f'{save_root}/cell_raw_dff')
     da.map_blocks(compute_cell_raw_dff, trans_data_t.astype('float'), mask, dtype='float32', chunks=(1, 1, 1, 1), save_root=save_root, ext='').compute()
-    fdask.terminate_workers(cluster, client)
+    
+    if numCore is not None: fdask.terminate_workers(cluster, client)
+    
     return None
 
 
